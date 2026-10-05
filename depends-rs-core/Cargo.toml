@@ -1,5 +1,5 @@
 [package]
-name = "depends-core"
+name = "depends-rs-core"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
@@ -7,7 +7,7 @@ description = "Syntax, shape metadata, and expansion planning for depends-rs"
 license = "MPL-2.0"
 readme = "README.md"
 repository = "https://github.com/yuygfgg/depends-rs"
-documentation = "https://docs.rs/depends-core"
+documentation = "https://docs.rs/depends-rs-core"
 keywords = ["borrowing", "lifetimes", "proc-macro", "rust"]
 categories = ["development-tools::procedural-macro-helpers", "rust-patterns"]
 

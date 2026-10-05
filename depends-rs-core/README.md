@@ -1,6 +1,6 @@
-# depends-core
+# depends-rs-core
 
-`depends-core` provides the syntax transformations used by the `depends-rs` procedural macros.
+`depends-rs-core` provides the syntax transformations used by the `depends-rs` procedural macros.
 
 Most applications should depend on [`depends-rs`](https://crates.io/crates/depends-rs).
 
