@@ -1,6 +1,6 @@
 # depends-rs
 
-`depends-rs` lets you describe borrowed Rust APIs without writing the same lifetime parameters and lifetime arguments by hand.
+`depends-rs` lets you express Rust borrow relationships declaratively by mapping data dependencies instead of manually wiring lifetime generics.
 
 It generates ordinary Rust. The Rust compiler still checks every borrow, every function body, and every outlives rule.
 
@@ -219,15 +219,13 @@ async fn example() {
 fn main() {}
 ```
 
-<details>
-<summary><b>See generated signature</b></summary>
+The generated signature is:
 
 ```rust,ignore
 async fn make<'text>(text: &'text str) -> View<'text> {
     View { data: text }
 }
 ```
-</details>
 
 The input must stay alive until the future finishes and the returned borrowed value is no longer used.
 
