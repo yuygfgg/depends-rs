@@ -585,4 +585,4 @@ cargo fmt --all -- --check
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under the Mozilla Public License 2.0. See [LICENSE](LICENSE).
