@@ -160,6 +160,9 @@ impl<'a> Elaborator<'a> {
                 .contains_key(&segment.ident.unraw().to_string())
                 || segment.ident == "Self"
         });
+        // Opaque is a boundary around this named type. `named` still visits
+        // its type arguments below, so `Vec<&str>` can expose the reference
+        // while `Vec` itself does not need lifetime-shape metadata.
         let opaque = generic || explicit || self.is_opaque(&bare);
         let shape = if opaque {
             None
@@ -308,6 +311,10 @@ impl<'a> Elaborator<'a> {
         Ok(())
     }
 
+    /// Skip metadata lookup for explicit exclusions and built-in type names.
+    /// This check uses path spelling, without resolving imports or aliases.
+    /// `named` also skips lookup for explicit lifetime arguments and paths
+    /// rooted in a type parameter or `Self`.
     fn is_opaque(&self, path: &Path) -> bool {
         if self
             .options

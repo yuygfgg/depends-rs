@@ -162,9 +162,13 @@ impl View {
 
 ### Opaque and External Types
 
-If a struct contains a foreign type that was not annotated with `#[lifetimes]`, use `opaque(...)` to inform the macro that the type should be treated as an opaque leaf without internal lifetime inspection:
+`opaque(...)` marks a named type as a boundary in lifetime-shape expansion. The macro does not query metadata for that type or expose fields from its own definition as dependency paths. Annotate the type with `#[lifetimes]` when those fields must be addressable.
 
-```rust,ignore
+Use `opaque(...)` on `#[lifetimes]` or `#[depends]` for an unannotated type, including a type from another crate. Supply the type path as used in the item, without generic arguments:
+
+```rust
+use depends_rs::lifetimes;
+
 struct ExternalType;
 
 #[lifetimes(opaque(ExternalType))]
@@ -174,6 +178,37 @@ struct Holder {
 }
 // Expands to: struct Holder<'text> { value: ExternalType, text: &'text str }
 ```
+
+Here, `return.value.field` cannot refer to a field inside `ExternalType`. To expose such fields, annotate the type's definition with `#[lifetimes]` and remove its `opaque(...)` entry.
+
+Lifetime-shape lookup is also skipped automatically for:
+
+- primitive names: `str`, `bool`, `char`, `i8` through `i128`, `u8` through `u128`, `isize`, `usize`, `f32`, and `f64`;
+- paths whose first segment is `std`, `core`, or `alloc`;
+- the unqualified names `String`, `Vec`, `Option`, `Result`, `Box`, `Cow`, `Rc`, `Arc`, `Cell`, `RefCell`, `UnsafeCell`, `Pin`, `PhantomData`, `MaybeUninit`, `HashMap`, `HashSet`, `BTreeMap`, `BTreeSet`, `VecDeque`, `LinkedList`, `BinaryHeap`, `Mutex`, `RwLock`, `Path`, `PathBuf`, `OsStr`, `OsString`, `CStr`, and `CString`;
+- type parameters and paths that start with a type parameter or `Self`, such as `T`, `T::Item`, and `Self::Item`;
+- paths with any explicit lifetime argument, including `View<'a>`, `View<'static>`, and `View<'_>`, even if the type has `#[lifetimes]` metadata.
+
+These checks use the written path, without resolving imports or aliases. A renamed standard-library type may need an `opaque(...)` entry. A local type named `Vec` also matches the built-in list.
+
+If an opaque type has its own lifetime parameters, write the required parameters, arguments, and relationships with ordinary Rust syntax:
+
+```rust
+use depends_rs::depends;
+
+struct ExternalView<'a> {
+    data: &'a str,
+}
+
+#[depends]
+fn external_view<'a>(text: &'a str) -> ExternalView<'a> {
+    ExternalView { data: text }
+}
+```
+
+The shared `'a` connects the input borrow to the returned value. The explicit argument in `ExternalView<'a>` already skips lookup, so `opaque(ExternalView)` is unnecessary here. A contract such as `return.data = text` cannot inspect this occurrence. Rust still checks the declared lifetimes and the function body.
+
+Opacity does not stop all recursive processing. The macro still processes an enclosing reference and type arguments on the final path segment. For `rows: Vec<&str>`, it generates a lifetime for `&str`, accessible at `rows`. For `rows: Vec<View>`, an annotated `View` can expose `rows.data`. A single type argument uses the enclosing dependency path; multiple type arguments use numeric indices, such as `entries.0` and `entries.1` for `HashMap<&str, &str>`. These paths come from the written type arguments, without inspection of the container's fields.
 
 ---
 
@@ -368,6 +403,36 @@ fn set_name<'slot, 'data, 'config, 'name>(
 ```
 The constraint `'name: 'data` ensures safety without forcing `out` to change its lifetime type.
 </details>
+
+---
+
+### Nested Mutable References
+
+Nested mutable references have separate dependency paths. The outer borrow is named `input`; the inner mutable reference is addressed as `input.deref`. When the returned reference uses the inner slot, add an outlives relation for the reborrow:
+
+```rust,ignore
+#[depends(return = input.deref, input.deref <= input)]
+fn project(input: &mut &mut i32) -> &mut i32 {
+    &mut **input
+}
+```
+
+<details>
+<summary><b>See generated signature and where clause</b></summary>
+
+```rust,ignore
+fn project<'outer, 'inner>(
+    input: &'outer mut &'inner mut i32,
+) -> &'inner mut i32
+where
+    'outer: 'inner,
+{
+    &mut **input
+}
+```
+</details>
+
+`input.deref <= input` states that the outer borrow must last at least as long as the inner returned borrow. Use the more specific path when a contract targets a nested reference instead of the outer borrow.
 
 ---
 
