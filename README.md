@@ -30,7 +30,7 @@ fn main() {
 
 The generated form is:
 
-```rust,ignore
+```rust
 struct Pair<'left, 'right> {
     left: &'left i32,
     right: &'right i32,
@@ -50,20 +50,17 @@ This function returns a small object that borrows two values. The first returned
 
 ### Structs and Nested Types
 
-`#[lifetimes]` generates independent lifetime parameters for each reference field. Field names determine parameter names:
+`#[lifetimes]` generates independent lifetime parameters for each reference field. Field names determine parameter names. Nested borrowed types retain full lifetime granularity through path prefixes:
 
-```rust,ignore
+```rust
+use depends_rs::lifetimes;
 #[lifetimes]
 struct Split {
     head: &str,
     tail: &str,
 }
 // Expands to: struct Split<'head, 'tail> { head: &'head str, tail: &'tail str }
-```
 
-Nested borrowed types retain full lifetime granularity through path prefixes:
-
-```rust,ignore
 #[lifetimes]
 struct Outer {
     parts: Split,
@@ -78,9 +75,11 @@ Because lifetimes remain distinct, a function can return `parts.head` from one s
 
 ### Tuples and Enums
 
-Paths follow the structural shape of your type definitions:
+Paths follow the structural shape of your type definitions. Tuple elements use numeric indices (`.0`, `.1`), while enum variants use their variant names:
 
-```rust,ignore
+```rust
+use depends_rs::{depends, lifetimes};
+
 #[lifetimes]
 struct Tuple<T>(&str, T);
 // Expands to: struct Tuple<'prefix, T>(&'prefix str, T);
@@ -91,11 +90,7 @@ enum Selection<T> {
     Right { value: &str },
     Pair(&str, &str),
 }
-```
 
-Tuple elements use numeric indices (`.0`, `.1`), while enum variants use their variant names:
-
-```rust,ignore
 #[depends(
     return = a,
     return.Right.value = b,
@@ -115,7 +110,14 @@ fn select(a: &str, b: &str, index: u8) -> Selection<u8> {
 ### Generics and Containers
 
 - **Generic fields**: Dependency paths follow field names, not generic argument indices:
-  ```rust,ignore
+  ```rust
+  use depends_rs::{depends, lifetimes};
+
+  #[lifetimes]
+  struct View {
+      data: &str,
+  }
+
   #[lifetimes]
   struct Wrapper<T> {
       prefix: &str,
@@ -124,11 +126,15 @@ fn select(a: &str, b: &str, index: u8) -> Selection<u8> {
 
   // To target `data` inside `value: View`: use `return.value.data`
   #[depends(return.prefix = text, return.value.data = data)]
-  fn make(text: &str, data: &str) -> Wrapper<View> { ... }
+  fn make(text: &str, data: &str) -> Wrapper<View> {
+      Wrapper { prefix: text, value: View { data } }
+  }
   ```
 
 - **Containers (`Vec`, arrays, slices)**: Collections of references share a single lifetime parameter per field:
-  ```rust,ignore
+  ```rust
+  use depends_rs::lifetimes;
+
   #[lifetimes]
   struct Sample {
       rows: Vec<&str>,       // all rows share 'rows
@@ -143,7 +149,9 @@ fn select(a: &str, b: &str, index: u8) -> Selection<u8> {
 
 When implementing methods on types decorated with `#[lifetimes]`, attach `#[lifetimes]` to the `impl` block to avoid manually writing lifetime generics:
 
-```rust,ignore
+```rust
+use depends_rs::lifetimes;
+
 #[lifetimes]
 struct View {
     data: &str,
@@ -218,7 +226,14 @@ Opacity does not stop all recursive processing. The macro still processes an enc
 
 The basic building block maps an input borrow to a returned field:
 
-```rust,ignore
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct View {
+    data: &str,
+}
+
 #[depends(return.data = text)]
 fn make(text: &str) -> View {
     View { data: text }
@@ -254,13 +269,19 @@ async fn example() {
 fn main() {}
 ```
 
-The generated signature is:
+<details>
+<summary><b>See generated signature</b></summary>
 
-```rust,ignore
+```rust
+struct View<'text> {
+    data: &'text str,
+}
+
 async fn make<'text>(text: &'text str) -> View<'text> {
     View { data: text }
 }
 ```
+</details>
 
 The input must stay alive until the future finishes and the returned borrowed value is no longer used.
 
@@ -270,7 +291,9 @@ The input must stay alive until the future finishes and the returned borrowed va
 
 When a trait method returns a borrowed type, add `#[depends]` to the method. The same syntax works for method declarations, default methods, and async methods:
 
-```rust,ignore
+```rust
+use depends_rs::{depends, lifetimes};
+
 #[lifetimes]
 struct View {
     data: &str,
@@ -283,24 +306,8 @@ trait Reader {
     #[depends(return.data = text)]
     async fn read_async(&self, text: &str) -> View;
 }
-```
 
-The input and returned field use the same lifetime:
-
-<details>
-<summary><b>See generated signatures</b></summary>
-
-```rust,ignore
-trait Reader {
-    fn read<'text>(&self, text: &'text str) -> View<'text>;
-    async fn read_async<'text>(&self, text: &'text str) -> View<'text>;
-}
-```
-</details>
-
-Implementations can use the same contract:
-
-```rust,ignore
+// Implementations can use the same contract.
 struct Provider;
 
 impl Reader for Provider {
@@ -316,6 +323,21 @@ impl Reader for Provider {
 }
 ```
 
+<details>
+<summary><b>See generated signatures</b></summary>
+
+```rust
+struct View<'text> {
+    data: &'text str,
+}
+
+trait Reader {
+    fn read<'text>(&self, text: &'text str) -> View<'text>;
+    async fn read_async<'text>(&self, text: &'text str) -> View<'text>;
+}
+```
+</details>
+
 The trait itself does not need `#[lifetimes]`. Rustc checks that each implementation satisfies the expanded signature.
 
 ---
@@ -326,7 +348,14 @@ When an input parameter is already a borrowed struct, you can depend on either:
 - The temporary borrow of the wrapper itself (`cfg`), or
 - An inner borrowed field inside the wrapper (`cfg.name`):
 
-```rust,ignore
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct Config {
+    name: &str,
+}
+
 #[depends(return = cfg.name)]
 fn get(cfg: &Config) -> &str {
     cfg.name
@@ -336,13 +365,18 @@ fn get(cfg: &Config) -> &str {
 <details>
 <summary><b>See generated signature</b></summary>
 
-```rust,ignore
+```rust
+struct Config<'name> {
+    name: &'name str,
+}
+
 fn get<'config, 'name>(cfg: &'config Config<'name>) -> &'name str {
     cfg.name
 }
 ```
-Because the return value borrows `'name` rather than `'config`, callers can drop or release `cfg` while keeping the returned string reference valid.
 </details>
+
+Because the return value borrows `'name` rather than `'config`, callers can drop or release `cfg` while keeping the returned string reference valid.
 
 ---
 
@@ -350,17 +384,28 @@ Because the return value borrows `'name` rather than `'config`, callers can drop
 
 When an entire composite structure originates from a single source, use a broad mapping:
 
-```rust,ignore
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct Split {
+    head: &str,
+    tail: &str,
+}
+
 // Maps all borrowed fields in `Split` to `text`
 #[depends(return = text)]
 fn duplicate(text: &str) -> Split {
     Split { head: text, tail: text }
 }
-```
 
-You can combine a broad mapping with fine-grained overrides. More specific paths take precedence:
+#[lifetimes]
+struct Outer {
+    parts: Split,
+    label: &str,
+}
 
-```rust,ignore
+// More specific paths override a broad mapping.
 #[depends(
     return = text,            // Default: all fields come from `text`
     return.parts.tail = focus // Override: only `tail` comes from `focus`
@@ -381,7 +426,19 @@ When modifying an existing borrowed value through a mutable reference (`&mut Vie
 
 Instead, use `<=` to express an **outlives constraint** (`'source: 'target`): the incoming data must live at least as long as the slot being modified.
 
-```rust,ignore
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct View {
+    data: &str,
+}
+
+#[lifetimes]
+struct Config {
+    name: &str,
+}
+
 #[depends(out.data <= cfg.name)]
 fn set_name(out: &mut View, cfg: &Config) {
     out.data = cfg.name;
@@ -391,7 +448,15 @@ fn set_name(out: &mut View, cfg: &Config) {
 <details>
 <summary><b>See generated signature and where clause</b></summary>
 
-```rust,ignore
+```rust
+struct View<'data> {
+    data: &'data str,
+}
+
+struct Config<'name> {
+    name: &'name str,
+}
+
 fn set_name<'slot, 'data, 'config, 'name>(
     out: &'slot mut View<'data>,
     cfg: &'config Config<'name>,
@@ -401,8 +466,9 @@ fn set_name<'slot, 'data, 'config, 'name>(
     out.data = cfg.name;
 }
 ```
-The constraint `'name: 'data` ensures safety without forcing `out` to change its lifetime type.
 </details>
+
+The constraint `'name: 'data` ensures safety without forcing `out` to change its lifetime type.
 
 ---
 
@@ -410,7 +476,9 @@ The constraint `'name: 'data` ensures safety without forcing `out` to change its
 
 Nested mutable references have separate dependency paths. The outer borrow is named `input`; the inner mutable reference is addressed as `input.deref`. When the returned reference uses the inner slot, add an outlives relation for the reborrow:
 
-```rust,ignore
+```rust
+use depends_rs::depends;
+
 #[depends(return = input.deref, input.deref <= input)]
 fn project(input: &mut &mut i32) -> &mut i32 {
     &mut **input
@@ -420,7 +488,7 @@ fn project(input: &mut &mut i32) -> &mut i32 {
 <details>
 <summary><b>See generated signature and where clause</b></summary>
 
-```rust,ignore
+```rust
 fn project<'outer, 'inner>(
     input: &'outer mut &'inner mut i32,
 ) -> &'inner mut i32
@@ -440,7 +508,14 @@ where
 
 If a mutation cannot satisfy the old lifetime slot (or you need to rebind with a new lifetime), consume the old value by value and return a fresh one:
 
-```rust,ignore
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct View {
+    data: &str,
+}
+
 #[depends(return.data = text)]
 fn reset(_old: View, text: &str) -> View {
     View { data: text }
@@ -455,7 +530,19 @@ The caller drops ownership of the old view and receives a new view tied to `text
 
 `depends-rs` relies on macro-generated metadata tokens attached to annotated items. Standard Rust visibility, aliases, glob imports, and cross-crate re-exports work out of the box:
 
-```rust,ignore
+```rust
+use depends_rs::depends;
+
+mod model {
+    use depends_rs::lifetimes;
+
+    #[lifetimes]
+    pub struct View {
+        pub data: &str,
+    }
+}
+
+// `model` can also be a dependency crate.
 use model::View as PublicView;
 
 #[depends(return.data = text)]
@@ -466,7 +553,11 @@ fn make(text: &str) -> PublicView {
 
 If `depends-rs` is renamed in your `Cargo.toml`, pass `crate_path`:
 
-```rust,ignore
+```rust
+extern crate depends_rs as my_depends;
+
+use my_depends::{depends, lifetimes};
+
 #[lifetimes(crate_path = my_depends)]
 struct View { data: &str }
 
