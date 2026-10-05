@@ -1,0 +1,9 @@
+[package]
+name = "depends-test-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[dependencies]
+depends-rs = { path = "../../.." }
+depends-test-model = { path = "../model" }
+depends-test-facade = { path = "../facade" }

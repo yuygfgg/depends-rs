@@ -1,0 +1,15 @@
+[package]
+name = "depends-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Syntax, shape metadata, and expansion planning for depends-rs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits", "visit-mut"] }
+
+[lints]
+workspace = true

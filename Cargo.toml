@@ -1,0 +1,30 @@
+[package]
+name = "depends-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Dependency-oriented lifetime elaboration for Rust"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+depends-core = { path = "depends-core", version = "0.1.0" }
+
+[workspace]
+resolver = "2"
+members = [
+    "depends-core",
+    "tests/fixtures/model",
+    "tests/fixtures/facade",
+    "tests/fixtures/consumer",
+    "tests/fixtures/renamed",
+]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[lints]
+workspace = true
