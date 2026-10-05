@@ -4,6 +4,8 @@
 
 It generates ordinary Rust. The Rust compiler still checks every borrow, every function body, and every outlives rule.
 
+`depends-rs` can be seen as a spiritual successor to [Cyan](https://github.com/yuygfgg/cyan)
+
 ## Quick Start
 
 ```rust
