@@ -25,7 +25,7 @@ TOML
         reject_mutable_rebind)
             grep -F 'would rebind the lifetime of an existing value' "$log" >/dev/null
             ;;
-        reject_wrong_body|reject_generic_wrong_body)
+        reject_wrong_body|reject_generic_wrong_body|reject_trait_wrong_body)
             grep -F 'lifetime may not live long enough' "$log" >/dev/null
             ;;
         reject_opaque_dive)

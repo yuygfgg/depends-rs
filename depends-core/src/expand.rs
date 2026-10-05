@@ -8,7 +8,7 @@ use syn::{
     parse::{Parse, ParseStream},
     spanned::Spanned,
     visit_mut::VisitMut,
-    Error, Ident, Item, ItemFn, Lifetime, Path, Result, ReturnType, Token,
+    Error, Ident, Item, ItemFn, Lifetime, Path, Result, ReturnType, Signature, Token, TraitItemFn,
 };
 
 use crate::elaborate::{fields, Binding, Elaborator};
@@ -16,6 +16,14 @@ use crate::protocol::{self, metadata};
 use crate::syntax::{path_key, DependencyPath, LifetimeShape, Options, Relation};
 
 type Shapes = BTreeMap<String, LifetimeShape>;
+
+/// An item accepted by `#[depends]`. A body-less trait method is not a Rust
+/// `ItemFn`, so it needs a separate transport form while metadata is resolved.
+#[derive(Clone)]
+enum ExpansionItem {
+    Rust(Item),
+    TraitMethod(TraitItemFn),
+}
 
 pub fn expand_lifetimes(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let options: Options = syn::parse2(attr)?;
@@ -36,7 +44,7 @@ pub fn expand_lifetimes(attr: TokenStream, item: TokenStream) -> Result<TokenStr
             ))
         }
     }
-    expand(options, item, Shapes::new())
+    expand(options, ExpansionItem::Rust(item), Shapes::new())
 }
 
 pub fn expand_depends(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
@@ -55,64 +63,48 @@ pub fn expand_depends(attr: TokenStream, item: TokenStream) -> Result<TokenStrea
             }
         }
     }
-    let item: ItemFn = syn::parse2(item)?;
-    expand(options, Item::Fn(item), Shapes::new())
+    let item = match syn::parse2::<ItemFn>(item.clone()) {
+        Ok(item) => ExpansionItem::Rust(Item::Fn(item)),
+        Err(_) => ExpansionItem::TraitMethod(syn::parse2::<TraitItemFn>(item)?),
+    };
+    expand(options, item, Shapes::new())
 }
 
 /// Each attempt starts from the original syntax. A suspended attempt discards
 /// all edits and carries only resolved metadata into the next attempt.
-fn expand(options: Options, original: Item, shapes: Shapes) -> Result<TokenStream> {
+fn expand(options: Options, original: ExpansionItem, shapes: Shapes) -> Result<TokenStream> {
     let mut item = original.clone();
     let generics = match &item {
-        Item::Struct(item) => item.generics.clone(),
-        Item::Enum(item) => item.generics.clone(),
-        Item::Impl(item) => item.generics.clone(),
-        Item::Fn(item) => item.sig.generics.clone(),
-        _ => return Err(Error::new(item.span(), "unsupported depends-rs item")),
+        ExpansionItem::Rust(Item::Struct(item)) => item.generics.clone(),
+        ExpansionItem::Rust(Item::Enum(item)) => item.generics.clone(),
+        ExpansionItem::Rust(Item::Impl(item)) => item.generics.clone(),
+        ExpansionItem::Rust(Item::Fn(item)) => item.sig.generics.clone(),
+        ExpansionItem::TraitMethod(item) => item.sig.generics.clone(),
+        ExpansionItem::Rust(item) => {
+            return Err(Error::new(item.span(), "unsupported depends-rs item"))
+        }
     };
     let mut elaborator = Elaborator::new(&generics, &options, &shapes);
     match &mut item {
-        Item::Struct(item) => fields(&mut elaborator, &mut item.fields, None)?,
-        Item::Enum(item) => {
+        ExpansionItem::Rust(Item::Struct(item)) => fields(&mut elaborator, &mut item.fields, None)?,
+        ExpansionItem::Rust(Item::Enum(item)) => {
             for variant in &mut item.variants {
                 let prefix =
                     DependencyPath::root(variant.ident.unraw().to_string(), variant.span());
                 fields(&mut elaborator, &mut variant.fields, Some(&prefix))?;
             }
         }
-        Item::Impl(item) => {
+        ExpansionItem::Rust(Item::Impl(item)) => {
             let path = DependencyPath::root("self", item.self_ty.span());
             elaborator.ty(&mut item.self_ty, &path)?;
         }
-        Item::Fn(item) => {
-            for (index, input) in item.sig.inputs.iter_mut().enumerate() {
-                match input {
-                    syn::FnArg::Typed(argument) => {
-                        let name = match &*argument.pat {
-                            syn::Pat::Ident(pattern) => pattern.ident.unraw().to_string(),
-                            _ => format!("arg{index}"),
-                        };
-                        let path = DependencyPath::root(name, argument.pat.span());
-                        elaborator.ty(&mut argument.ty, &path)?;
-                    }
-                    syn::FnArg::Receiver(receiver) => {
-                        if let Some((_, lifetime)) = &mut receiver.reference {
-                            let path = DependencyPath::root("self", receiver.self_token.span);
-                            let lifetime = lifetime.get_or_insert_with(|| elaborator.fresh(&path));
-                            elaborator.bindings.push(Binding {
-                                path,
-                                lifetime: lifetime.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-            if let ReturnType::Type(_, ty) = &mut item.sig.output {
-                let path = DependencyPath::root("return", ty.span());
-                elaborator.ty(ty, &path)?;
-            }
+        ExpansionItem::Rust(Item::Fn(item)) => {
+            elaborate_signature(&mut item.sig, &mut elaborator)?;
         }
-        _ => unreachable!(),
+        ExpansionItem::TraitMethod(item) => {
+            elaborate_signature(&mut item.sig, &mut elaborator)?;
+        }
+        ExpansionItem::Rust(_) => unreachable!(),
     }
     if !elaborator.pending.is_empty() {
         return PendingExpansion {
@@ -151,22 +143,22 @@ fn expand(options: Options, original: Item, shapes: Shapes) -> Result<TokenStrea
             .collect(),
     };
     match &mut item {
-        Item::Struct(item) => {
+        ExpansionItem::Rust(Item::Struct(item)) => {
             crate::syntax::prepend_lifetimes(&mut item.generics, &elaborator.generated);
             let transport = metadata(&item.ident, &item.vis, &item.attrs, &quote!(#item), &shape);
             Ok(quote!(#item #transport))
         }
-        Item::Enum(item) => {
+        ExpansionItem::Rust(Item::Enum(item)) => {
             crate::syntax::prepend_lifetimes(&mut item.generics, &elaborator.generated);
             let transport = metadata(&item.ident, &item.vis, &item.attrs, &quote!(#item), &shape);
             Ok(quote!(#item #transport))
         }
-        Item::Impl(item) => {
+        ExpansionItem::Rust(Item::Impl(item)) => {
             crate::syntax::prepend_lifetimes(&mut item.generics, &elaborator.generated);
             Ok(quote!(#item))
         }
-        Item::Fn(item) => {
-            let substitutions = apply_relations(item, &elaborator, &options.relations)?;
+        ExpansionItem::Rust(Item::Fn(item)) => {
+            let substitutions = apply_relations(&mut item.sig, &elaborator, &options.relations)?;
             let generated = elaborator
                 .generated
                 .into_iter()
@@ -175,14 +167,54 @@ fn expand(options: Options, original: Item, shapes: Shapes) -> Result<TokenStrea
             crate::syntax::prepend_lifetimes(&mut item.sig.generics, &generated);
             Ok(quote!(#item))
         }
-        _ => unreachable!(),
+        ExpansionItem::TraitMethod(item) => {
+            let substitutions = apply_relations(&mut item.sig, &elaborator, &options.relations)?;
+            let generated = elaborator
+                .generated
+                .into_iter()
+                .filter(|lifetime| !substitutions.contains_key(&lifetime.ident.to_string()))
+                .collect::<Vec<_>>();
+            crate::syntax::prepend_lifetimes(&mut item.sig.generics, &generated);
+            Ok(quote!(#item))
+        }
+        ExpansionItem::Rust(_) => unreachable!(),
     }
+}
+
+fn elaborate_signature(signature: &mut Signature, elaborator: &mut Elaborator<'_>) -> Result<()> {
+    for (index, input) in signature.inputs.iter_mut().enumerate() {
+        match input {
+            syn::FnArg::Typed(argument) => {
+                let name = match &*argument.pat {
+                    syn::Pat::Ident(pattern) => pattern.ident.unraw().to_string(),
+                    _ => format!("arg{index}"),
+                };
+                let path = DependencyPath::root(name, argument.pat.span());
+                elaborator.ty(&mut argument.ty, &path)?;
+            }
+            syn::FnArg::Receiver(receiver) => {
+                if let Some((_, lifetime)) = &mut receiver.reference {
+                    let path = DependencyPath::root("self", receiver.self_token.span);
+                    let lifetime = lifetime.get_or_insert_with(|| elaborator.fresh(&path));
+                    elaborator.bindings.push(Binding {
+                        path,
+                        lifetime: lifetime.clone(),
+                    });
+                }
+            }
+        }
+    }
+    if let ReturnType::Type(_, ty) = &mut signature.output {
+        let path = DependencyPath::root("return", ty.span());
+        elaborator.ty(ty, &path)?;
+    }
+    Ok(())
 }
 
 /// Return substitutions are simultaneous. Sequential text replacement could
 /// accidentally replace a lifetime introduced by an earlier relation.
 fn apply_relations(
-    item: &mut ItemFn,
+    signature: &mut Signature,
     elaborator: &Elaborator<'_>,
     relations: &[Relation],
 ) -> Result<BTreeMap<String, Lifetime>> {
@@ -243,7 +275,7 @@ fn apply_relations(
             }
         }
     }
-    if let ReturnType::Type(_, ty) = &mut item.sig.output {
+    if let ReturnType::Type(_, ty) = &mut signature.output {
         Substitute(&substitutions).visit_type_mut(ty);
     }
     for relation in relations
@@ -256,7 +288,7 @@ fn apply_relations(
         let target_lt = substitutions
             .get(&target.lifetime.ident.to_string())
             .unwrap_or(&target.lifetime);
-        item.sig
+        signature
             .generics
             .make_where_clause()
             .predicates
@@ -342,7 +374,7 @@ fn path_error(elaborator: &Elaborator<'_>, path: &DependencyPath) -> Error {
 /// Token transport has no process-global state and contains no file paths.
 /// Shape keys are complete source paths, including aliases and qualifiers.
 struct PendingExpansion {
-    item: Item,
+    item: ExpansionItem,
     options: Options,
     pending: Vec<Path>,
     shapes: Shapes,
@@ -378,7 +410,12 @@ impl ToTokens for PendingExpansion {
         let entries = shapes
             .iter()
             .map(|(key, shape)| quote! { #key => { #shape } });
+        let (kind, item) = match item {
+            ExpansionItem::Rust(item) => (quote!(rust_item), quote!(#item)),
+            ExpansionItem::TraitMethod(item) => (quote!(trait_method), quote!(#item)),
+        };
         output.extend(quote! {
+            item_kind = #kind;
             item = { #item };
             options = { #options };
             pending = [#(#pending),*];
@@ -397,10 +434,22 @@ impl Parse for PendingExpansion {
             input.parse::<Token![=]>()?;
             Ok(())
         }
+        field(input, "item_kind")?;
+        let kind: Ident = input.parse()?;
+        input.parse::<Token![;]>()?;
         field(input, "item")?;
         let group;
         braced!(group in input);
-        let item = group.parse()?;
+        let item = match kind.to_string().as_str() {
+            "rust_item" => ExpansionItem::Rust(group.parse::<Item>()?),
+            "trait_method" => ExpansionItem::TraitMethod(group.parse::<TraitItemFn>()?),
+            _ => {
+                return Err(Error::new(
+                    kind.span(),
+                    "invalid depends-rs metadata item kind",
+                ))
+            }
+        };
         input.parse::<Token![;]>()?;
         field(input, "options")?;
         let group;

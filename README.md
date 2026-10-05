@@ -193,6 +193,100 @@ fn make(text: &str) -> View {
 
 ---
 
+### Async Functions
+
+The same contract works on `async fn`. The generated lifetime belongs to the function signature, so the future resolves to a value that borrows from the input:
+
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct View {
+    data: &str,
+}
+
+#[depends(return.data = text)]
+async fn make(text: &str) -> View {
+    View { data: text }
+}
+
+async fn example() {
+    let text = String::from("value");
+    let view = make(&text).await;
+    assert_eq!(view.data, "value");
+}
+
+fn main() {}
+```
+
+<details>
+<summary><b>See generated signature</b></summary>
+
+```rust,ignore
+async fn make<'text>(text: &'text str) -> View<'text> {
+    View { data: text }
+}
+```
+</details>
+
+The input must stay alive until the future finishes and the returned borrowed value is no longer used.
+
+---
+
+### Trait Methods
+
+When a trait method returns a borrowed type, add `#[depends]` to the method. The same syntax works for method declarations, default methods, and async methods:
+
+```rust,ignore
+#[lifetimes]
+struct View {
+    data: &str,
+}
+
+trait Reader {
+    #[depends(return.data = text)]
+    fn read(&self, text: &str) -> View;
+
+    #[depends(return.data = text)]
+    async fn read_async(&self, text: &str) -> View;
+}
+```
+
+The input and returned field use the same lifetime:
+
+<details>
+<summary><b>See generated signatures</b></summary>
+
+```rust,ignore
+trait Reader {
+    fn read<'text>(&self, text: &'text str) -> View<'text>;
+    async fn read_async<'text>(&self, text: &'text str) -> View<'text>;
+}
+```
+</details>
+
+Implementations can use the same contract:
+
+```rust,ignore
+struct Provider;
+
+impl Reader for Provider {
+    #[depends(return.data = text)]
+    fn read(&self, text: &str) -> View {
+        View { data: text }
+    }
+
+    #[depends(return.data = text)]
+    async fn read_async(&self, text: &str) -> View {
+        View { data: text }
+    }
+}
+```
+
+The trait itself does not need `#[lifetimes]`. Rustc checks that each implementation satisfies the expanded signature.
+
+---
+
 ### Extracting Inner Fields from Inputs
 
 When an input parameter is already a borrowed struct, you can depend on either:
