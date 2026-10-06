@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "depends-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "depends-rs-core",
 ]
 
 [[package]]
 name = "depends-rs-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",

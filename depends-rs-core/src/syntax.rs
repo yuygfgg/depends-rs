@@ -105,23 +105,52 @@ pub struct LifetimeShape {
 pub enum Relation {
     Construct {
         target: DependencyPath,
-        source: DependencyPath,
+        source: DependencySource,
+    },
+    Map {
+        target: DependencyPath,
+        source: DependencySource,
     },
     Outlives {
         target: DependencyPath,
-        source: DependencyPath,
+        source: DependencySource,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum DependencySource {
+    Path(DependencyPath),
+    Lifetime(Lifetime),
+}
+
+impl DependencySource {
+    pub(crate) fn span(&self) -> Span {
+        match self {
+            Self::Path(path) => path.span,
+            Self::Lifetime(lifetime) => lifetime.span(),
+        }
+    }
+
+    pub(crate) fn display(&self) -> String {
+        match self {
+            Self::Path(path) => path.display(),
+            Self::Lifetime(lifetime) => lifetime.to_string(),
+        }
+    }
 }
 
 impl Relation {
     pub(crate) fn target(&self) -> &DependencyPath {
         match self {
-            Self::Construct { target, .. } | Self::Outlives { target, .. } => target,
+            Self::Construct { target, .. }
+            | Self::Map { target, .. }
+            | Self::Outlives { target, .. } => target,
         }
     }
-    pub(crate) fn source(&self) -> &DependencyPath {
+    pub(crate) fn source(&self) -> &DependencySource {
         match self {
             Self::Construct { source, .. } | Self::Outlives { source, .. } => source,
+            Self::Map { source, .. } => source,
         }
     }
 }
@@ -131,6 +160,7 @@ pub(crate) struct Options {
     pub opaque: Vec<Path>,
     pub crate_path: Path,
     pub relations: Vec<Relation>,
+    pub receiver: Option<LifetimeShape>,
 }
 
 impl Default for Options {
@@ -139,6 +169,7 @@ impl Default for Options {
             opaque: Vec::new(),
             crate_path: syn::parse_quote!(::depends_rs),
             relations: Vec::new(),
+            receiver: None,
         }
     }
 }
@@ -160,27 +191,53 @@ impl Parse for Options {
                 input.parse::<Ident>()?;
                 input.parse::<Token![=]>()?;
                 options.crate_path = input.parse()?;
+            } else if first == "receiver" && look.peek(Token![=]) {
+                input.parse::<Ident>()?;
+                input.parse::<Token![=]>()?;
+                let group;
+                syn::braced!(group in input);
+                options.receiver = Some(group.parse()?);
             } else {
                 let target = input.parse()?;
-                let construct = if input.peek(Token![<=]) {
+                let relation = if input.peek(Token![<=]) {
                     input.parse::<Token![<=]>()?;
-                    false
+                    Relation::Outlives {
+                        target,
+                        source: parse_source(input)?,
+                    }
+                } else if input.peek(Token![~]) {
+                    input.parse::<Token![~]>()?;
+                    input.parse::<Token![=]>()?;
+                    let source = parse_source(input)?;
+                    if matches!(source, DependencySource::Lifetime(_)) {
+                        return Err(syn::Error::new(
+                            source.span(),
+                            "the ~= relation requires an aggregate dependency path",
+                        ));
+                    }
+                    Relation::Map { target, source }
                 } else {
                     input.parse::<Token![=]>()?;
-                    true
+                    Relation::Construct {
+                        target,
+                        source: parse_source(input)?,
+                    }
                 };
-                let source = input.parse()?;
-                options.relations.push(if construct {
-                    Relation::Construct { target, source }
-                } else {
-                    Relation::Outlives { target, source }
-                });
+                options.relations.push(relation);
             }
             if !input.is_empty() {
                 input.parse::<Token![,]>()?;
             }
         }
         Ok(options)
+    }
+}
+
+fn parse_source(input: ParseStream) -> Result<DependencySource> {
+    if input.peek(Lifetime) {
+        Ok(DependencySource::Lifetime(input.parse()?))
+    } else {
+        Ok(DependencySource::Path(input.parse()?))
     }
 }
 
@@ -322,17 +379,30 @@ impl ToTokens for Options {
     fn to_tokens(&self, out: &mut proc_macro2::TokenStream) {
         let crate_path = &self.crate_path;
         let mut parts = vec![quote!(crate_path = #crate_path)];
+        if let Some(receiver) = &self.receiver {
+            parts.push(quote! { receiver = { #receiver } });
+        }
         for path in &self.opaque {
             parts.push(quote! { opaque(#path) });
         }
         for relation in &self.relations {
             let (target, source, op) = match relation {
                 Relation::Construct { target, source } => (target, source, quote!(=)),
+                Relation::Map { target, source } => (target, source, quote!(~=)),
                 Relation::Outlives { target, source } => (target, source, quote!(<=)),
             };
             parts.push(quote! { #target #op #source });
         }
         out.extend(quote! { #(#parts),* });
+    }
+}
+
+impl ToTokens for DependencySource {
+    fn to_tokens(&self, out: &mut proc_macro2::TokenStream) {
+        match self {
+            Self::Path(path) => path.to_tokens(out),
+            Self::Lifetime(lifetime) => lifetime.to_tokens(out),
+        }
     }
 }
 

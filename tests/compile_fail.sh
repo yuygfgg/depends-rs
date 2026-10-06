@@ -37,5 +37,23 @@ TOML
         reject_generic_argument_path)
             grep -F 'unknown dependency path `return.arg0.data`' "$log" >/dev/null
             ;;
+        reject_aggregate_broadcast)
+            grep -F 'aggregate dependency source `old` needs the `~=` relation' "$log" >/dev/null
+            ;;
+        reject_shape_mapping)
+            grep -F 'shape mapping `return` ~= `old` is missing source path `old.right`' "$log" >/dev/null
+            ;;
+        reject_receiver_field)
+            grep -F 'unknown dependency path `self.missing`' "$log" >/dev/null
+            ;;
+        reject_undeclared_lifetime)
+            grep -F 'undeclared lifetime source' "$log" >/dev/null
+            ;;
+        reject_lifetime_placeholder)
+            grep -F 'unsupported lifetime source' "$log" >/dev/null
+            ;;
+        reject_conflicting_assignment)
+            grep -F 'duplicate dependency assignment `return.data`' "$log" >/dev/null
+            ;;
     esac
 done

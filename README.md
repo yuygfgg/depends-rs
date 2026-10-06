@@ -168,6 +168,28 @@ impl View {
 // Expands to: impl<'data> View<'data> { ... }
 ```
 
+Methods in an annotated inherent `impl` can address stored fields through
+`self`. The receiver borrow and the lifetime stored in a field stay separate.
+This works for shared, mutable, and consuming receivers:
+
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct View {
+    data: &str,
+}
+
+#[lifetimes]
+impl View {
+    #[depends(return = self.data)]
+    fn data(&self) -> &str { self.data }
+
+    #[depends(return = self.data)]
+    fn into_data(self) -> &str { self.data }
+}
+```
+
 ---
 
 ### Opaque and External Types
@@ -199,6 +221,10 @@ Lifetime-shape lookup is also skipped automatically for:
 - type parameters and paths that start with a type parameter or `Self`, such as `T`, `T::Item`, and `Self::Item`;
 - paths with any explicit lifetime argument, including `View<'a>`, `View<'static>`, and `View<'_>`, even if the type has `#[lifetimes]` metadata.
 
+An annotated inherent `impl` is the exception for its self type. A known local
+shape is used there so `impl<'a> View<'a>` can expose paths such as
+`self.data`.
+
 These checks use the written path, without resolving imports or aliases. A renamed standard-library type may need an `opaque(...)` entry. A local type named `Vec` also matches the built-in list.
 
 If an opaque type has its own lifetime parameters, write the required parameters, arguments, and relationships with ordinary Rust syntax:
@@ -224,7 +250,7 @@ Opacity does not stop all recursive processing. The macro still processes an enc
 
 ## Declaring Contracts with `#[depends]`
 
-### Return Mappings (`=`)
+### Scalar Broadcasts (`=`)
 
 The basic building block maps an input borrow to a returned field:
 
@@ -242,6 +268,102 @@ fn make(text: &str) -> View {
 }
 // Lowered to: fn make<'text>(text: &'text str) -> View<'text>
 ```
+
+`=` is a scalar broadcast relation. It assigns one source lifetime to every
+matching target leaf. A more specific `=` relation overrides a broader one:
+
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct Split {
+    head: &str,
+    tail: &str,
+}
+
+#[depends(return = text)]
+fn duplicate(text: &str) -> Split {
+    Split { head: text, tail: text }
+}
+
+#[lifetimes]
+struct Outer {
+    parts: Split,
+    label: &str,
+}
+
+#[depends(
+    return = text,
+    return.parts.tail = focus
+)]
+fn split(text: &str, focus: &str) -> Outer {
+    Outer {
+        parts: Split { head: text, tail: focus },
+        label: text,
+    }
+}
+```
+
+---
+
+### Structural Mappings (`~=`)
+
+`~=` maps matching lifetime leaves between two aggregate values. The macro
+uses the relative dependency path below each relation target. A by-value
+aggregate cannot be used as the source of `=`; use `~=` for that case.
+
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct State {
+    name: &str,
+    config: &str,
+    cache: &str,
+}
+
+#[depends(return ~= old, return.cache = cache)]
+fn replace_cache(old: State, cache: &str) -> State {
+    State {
+        name: old.name,
+        config: old.config,
+        cache,
+    }
+}
+```
+
+The `~=` relation maps `return.name` to `old.name` and `return.config` to
+`old.config`. The more specific `=` relation overrides the mapping for
+`return.cache`. The macro reports the first missing relative path when
+aggregate shapes do not match.
+
+---
+
+### Explicit Lifetime Sources
+
+A declared function lifetime or `'static` can be the source of a relation:
+
+```rust
+use depends_rs::{depends, lifetimes};
+
+#[lifetimes]
+struct View { data: &str }
+
+struct External<'a> { data: &'a str }
+
+#[depends(return.data = 'a)]
+fn extract<'a>(input: External<'a>) -> View {
+    View { data: input.data }
+}
+
+#[depends(return.data = 'static)]
+fn builtin() -> View {
+    View { data: "builtin" }
+}
+```
+
+The lifetime must be declared on the function or be `'static`. The same source
+form works with `<=` outlives relations.
 
 ---
 
@@ -379,46 +501,6 @@ fn get<'config, 'name>(cfg: &'config Config<'name>) -> &'name str {
 </details>
 
 Because the return value borrows `'name` rather than `'config`, callers can drop or release `cfg` while keeping the returned string reference valid.
-
----
-
-### Broad Mappings and Specific Overrides
-
-When an entire composite structure originates from a single source, use a broad mapping:
-
-```rust
-use depends_rs::{depends, lifetimes};
-
-#[lifetimes]
-struct Split {
-    head: &str,
-    tail: &str,
-}
-
-// Maps all borrowed fields in `Split` to `text`
-#[depends(return = text)]
-fn duplicate(text: &str) -> Split {
-    Split { head: text, tail: text }
-}
-
-#[lifetimes]
-struct Outer {
-    parts: Split,
-    label: &str,
-}
-
-// More specific paths override a broad mapping.
-#[depends(
-    return = text,            // Default: all fields come from `text`
-    return.parts.tail = focus // Override: only `tail` comes from `focus`
-)]
-fn split(text: &str, focus: &str) -> Outer {
-    Outer {
-        parts: Split { head: text, tail: focus },
-        label: text,
-    }
-}
-```
 
 ---
 

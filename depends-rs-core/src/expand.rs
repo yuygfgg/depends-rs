@@ -8,12 +8,13 @@ use syn::{
     parse::{Parse, ParseStream},
     spanned::Spanned,
     visit_mut::VisitMut,
-    Error, Ident, Item, ItemFn, Lifetime, Path, Result, ReturnType, Signature, Token, TraitItemFn,
+    Error, Ident, ImplItem, Item, ItemFn, ItemImpl, Lifetime, Path, Result, ReturnType, Signature,
+    Token, TraitItemFn,
 };
 
 use crate::elaborate::{fields, Binding, Elaborator};
 use crate::protocol::{self, metadata};
-use crate::syntax::{path_key, DependencyPath, LifetimeShape, Options, Relation};
+use crate::syntax::{path_key, DependencyPath, DependencySource, LifetimeShape, Options, Relation};
 
 type Shapes = BTreeMap<String, LifetimeShape>;
 
@@ -50,15 +51,21 @@ pub fn expand_lifetimes(attr: TokenStream, item: TokenStream) -> Result<TokenStr
 pub fn expand_depends(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let options: Options = syn::parse2(attr)?;
     for relation in &options.relations {
-        if let Relation::Construct { target, source } = relation {
+        if let Relation::Construct { target, .. } | Relation::Map { target, .. } = relation {
             if !target
                 .segments
                 .first()
                 .is_some_and(|segment| segment == "return")
             {
+                let source = relation.source().display();
+                let operator = if matches!(relation, Relation::Map { .. }) {
+                    "~="
+                } else {
+                    "="
+                };
                 return Err(Error::new(target.span, format!(
-                    "`{} = {}` would rebind the lifetime of an existing value; use `{} <= {}`, or consume and return `{}`",
-                    target.display(), source.display(), target.display(), source.display(), target.segments[0]
+                    "`{} {} {}` would rebind the lifetime of an existing value; use `{} <= {}`, or consume and return `{}`",
+                    target.display(), operator, source, target.display(), source, target.segments[0]
                 )));
             }
         }
@@ -96,12 +103,18 @@ fn expand(options: Options, original: ExpansionItem, shapes: Shapes) -> Result<T
         }
         ExpansionItem::Rust(Item::Impl(item)) => {
             let path = DependencyPath::root("self", item.self_ty.span());
-            elaborator.ty(&mut item.self_ty, &path)?;
+            elaborator.receiver_ty(&mut item.self_ty, &path)?;
         }
         ExpansionItem::Rust(Item::Fn(item)) => {
+            if let Some(receiver) = options.receiver.as_ref() {
+                elaborator.add_receiver_shape(receiver);
+            }
             elaborate_signature(&mut item.sig, &mut elaborator)?;
         }
         ExpansionItem::TraitMethod(item) => {
+            if let Some(receiver) = options.receiver.as_ref() {
+                elaborator.add_receiver_shape(receiver);
+            }
             elaborate_signature(&mut item.sig, &mut elaborator)?;
         }
         ExpansionItem::Rust(_) => unreachable!(),
@@ -155,6 +168,7 @@ fn expand(options: Options, original: ExpansionItem, shapes: Shapes) -> Result<T
         }
         ExpansionItem::Rust(Item::Impl(item)) => {
             crate::syntax::prepend_lifetimes(&mut item.generics, &elaborator.generated);
+            attach_receiver_context(item, &shape);
             Ok(quote!(#item))
         }
         ExpansionItem::Rust(Item::Fn(item)) => {
@@ -211,6 +225,28 @@ fn elaborate_signature(signature: &mut Signature, elaborator: &mut Elaborator<'_
     Ok(())
 }
 
+fn attach_receiver_context(item: &mut ItemImpl, shape: &LifetimeShape) {
+    for impl_item in &mut item.items {
+        let ImplItem::Fn(method) = impl_item else {
+            continue;
+        };
+        for attribute in &mut method.attrs {
+            if !attribute.path().is_ident("depends") {
+                continue;
+            }
+            let receiver = quote! { receiver = { #shape } };
+            match &mut attribute.meta {
+                syn::Meta::List(list) if !list.tokens.is_empty() => {
+                    let existing = list.tokens.clone();
+                    list.tokens = quote! { #existing, #receiver };
+                }
+                syn::Meta::List(list) => list.tokens = receiver,
+                _ => attribute.meta = syn::parse_quote!(depends(#receiver)),
+            }
+        }
+    }
+}
+
 /// Return substitutions are simultaneous. Sequential text replacement could
 /// accidentally replace a lifetime introduced by an earlier relation.
 fn apply_relations(
@@ -220,7 +256,7 @@ fn apply_relations(
 ) -> Result<BTreeMap<String, Lifetime>> {
     let construct = relations
         .iter()
-        .filter(|r| matches!(r, Relation::Construct { .. }))
+        .filter(|r| matches!(r, Relation::Construct { .. } | Relation::Map { .. }))
         .collect::<Vec<_>>();
     for (index, relation) in construct.iter().enumerate() {
         if construct[..index]
@@ -242,7 +278,15 @@ fn apply_relations(
         {
             return Err(path_error(elaborator, relation.target()));
         }
-        source_binding(elaborator, relation.source())?;
+        match relation {
+            Relation::Construct { source, .. } => {
+                relation_source_lifetime(elaborator, source)?;
+            }
+            Relation::Map { source, target } => {
+                validate_shape_mapping(elaborator, target, source, &construct)?;
+            }
+            Relation::Outlives { .. } => unreachable!(),
+        }
     }
     let mut substitutions = BTreeMap::new();
     for binding in elaborator.bindings.iter().filter(|b| {
@@ -258,16 +302,22 @@ fn apply_relations(
         else {
             continue;
         };
-        let source = source_binding(elaborator, relation.source())?;
-        if binding.lifetime.ident == "static" && source.lifetime.ident != "static" {
+        let source_lifetime = match relation {
+            Relation::Construct { source, .. } => relation_source_lifetime(elaborator, source)?,
+            Relation::Map { source, target } => {
+                mapped_lifetime(elaborator, binding, target, source)?
+            }
+            Relation::Outlives { .. } => unreachable!(),
+        };
+        if binding.lifetime.ident == "static" && source_lifetime.ident != "static" {
             return Err(Error::new(
                 relation.target().span,
                 "an explicit 'static slot cannot be rebound to another dependency",
             ));
         }
         let key = binding.lifetime.ident.to_string();
-        if let Some(previous) = substitutions.insert(key, source.lifetime.clone()) {
-            if previous != source.lifetime {
+        if let Some(previous) = substitutions.insert(key, source_lifetime.clone()) {
+            if previous != source_lifetime {
                 return Err(Error::new(
                     relation.target().span,
                     "conflicting dependencies for slots that share a lifetime",
@@ -282,9 +332,11 @@ fn apply_relations(
         .iter()
         .filter(|r| matches!(r, Relation::Outlives { .. }))
     {
-        let source = source_binding(elaborator, relation.source())?;
+        let source = match relation {
+            Relation::Outlives { source, .. } => relation_source_lifetime(elaborator, source)?,
+            _ => unreachable!(),
+        };
         let target = unique_binding(elaborator, relation.target())?;
-        let source_lt = &source.lifetime;
         let target_lt = substitutions
             .get(&target.lifetime.ident.to_string())
             .unwrap_or(&target.lifetime);
@@ -292,7 +344,7 @@ fn apply_relations(
             .generics
             .make_where_clause()
             .predicates
-            .push(syn::parse_quote!(#source_lt: #target_lt));
+            .push(syn::parse_quote!(#source: #target_lt));
     }
     // Only output occurrences are replaced. Keep explicit parameters and any
     // generated parameter that is also used by an input.
@@ -333,7 +385,134 @@ fn source_binding<'a>(
             "a dependency source must name an input borrow",
         ));
     }
-    unique_binding(elaborator, path)
+    match unique_binding(elaborator, path) {
+        Ok(binding) => Ok(binding),
+        Err(_error)
+            if elaborator
+                .bindings
+                .iter()
+                .any(|binding| binding.path.starts_with(path) && binding.path != *path) =>
+        {
+            Err(Error::new(
+                path.span,
+                format!(
+                    "aggregate dependency source `{}` needs the `~=` relation",
+                    path.display()
+                ),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn relation_source_lifetime(
+    elaborator: &Elaborator<'_>,
+    source: &DependencySource,
+) -> Result<Lifetime> {
+    match source {
+        DependencySource::Path(path) => Ok(source_binding(elaborator, path)?.lifetime.clone()),
+        DependencySource::Lifetime(lifetime) if lifetime.ident == "static" => {
+            Ok(lifetime.clone())
+        }
+        DependencySource::Lifetime(lifetime) if lifetime.ident == "_" => Err(Error::new(
+            lifetime.span(),
+            "unsupported lifetime source `'_`; use a declared lifetime or `'static`",
+        )),
+        DependencySource::Lifetime(lifetime) if elaborator.has_lifetime(lifetime) => {
+            Ok(lifetime.clone())
+        }
+        DependencySource::Lifetime(lifetime) => Err(Error::new(
+            lifetime.span(),
+            format!(
+                "undeclared lifetime source `{lifetime}`; declare it on the function or use `'static`"
+            ),
+        )),
+    }
+}
+
+fn validate_shape_mapping(
+    elaborator: &Elaborator<'_>,
+    target: &DependencyPath,
+    source: &DependencySource,
+    relations: &[&Relation],
+) -> Result<()> {
+    let DependencySource::Path(source) = source else {
+        unreachable!("the parser rejects lifetime sources for ~=");
+    };
+    if source
+        .segments
+        .first()
+        .is_some_and(|segment| segment == "return")
+    {
+        return Err(Error::new(
+            source.span,
+            "a dependency source must name an input aggregate",
+        ));
+    }
+    let target_is_aggregate = elaborator.bindings.iter().any(|binding| {
+        binding.path.starts_with(target) && binding.path.segments.len() > target.segments.len()
+    });
+    if !target_is_aggregate {
+        return Err(Error::new(
+            target.span,
+            format!(
+                "`{}` is not an aggregate target; use `=` for a scalar relation",
+                target.display()
+            ),
+        ));
+    }
+    let source_is_aggregate = elaborator.bindings.iter().any(|binding| {
+        binding.path.starts_with(source) && binding.path.segments.len() > source.segments.len()
+    });
+    if !source_is_aggregate {
+        return Err(Error::new(
+            source.span,
+            format!("`{}` is not an aggregate source for `~=`", source.display()),
+        ));
+    }
+    for binding in elaborator.bindings.iter().filter(|binding| {
+        binding.path.starts_with(target) && binding.path.segments.len() > target.segments.len()
+    }) {
+        if relations.iter().any(|relation| {
+            relation.target().segments.len() > target.segments.len()
+                && binding.path.starts_with(relation.target())
+        }) {
+            continue;
+        }
+        let relative = &binding.path.segments[target.segments.len()..];
+        let source_path = source.append(relative);
+        if !elaborator
+            .bindings
+            .iter()
+            .any(|candidate| candidate.path == source_path)
+        {
+            return Err(Error::new(
+                binding.path.span,
+                format!(
+                    "shape mapping `{}` ~= `{}` is missing source path `{}` for target `{}`",
+                    target.display(),
+                    source.display(),
+                    source_path.display(),
+                    binding.path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mapped_lifetime(
+    elaborator: &Elaborator<'_>,
+    binding: &Binding,
+    target: &DependencyPath,
+    source: &DependencySource,
+) -> Result<Lifetime> {
+    let DependencySource::Path(source) = source else {
+        unreachable!("the parser rejects lifetime sources for ~=");
+    };
+    let relative = &binding.path.segments[target.segments.len()..];
+    let source_path = source.append(relative);
+    unique_binding(elaborator, &source_path).map(|binding| binding.lifetime.clone())
 }
 fn unique_binding<'a>(
     elaborator: &'a Elaborator<'_>,

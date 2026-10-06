@@ -10,4 +10,7 @@ mod protocol;
 mod syntax;
 
 pub use expand::{continue_expansion, expand_depends, expand_lifetimes};
-pub use syntax::{DependencyPath, GenericSlot, LifetimeShape, LifetimeSlot, OpaqueSlot, Relation};
+pub use syntax::{
+    DependencyPath, DependencySource, GenericSlot, LifetimeShape, LifetimeSlot, OpaqueSlot,
+    Relation,
+};

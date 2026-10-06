@@ -82,6 +82,37 @@ impl<'a> Elaborator<'a> {
         }
     }
 
+    /// Add the stored lifetime slots of an enclosing inherent impl. The
+    /// receiver borrow itself is added from the method signature, so these
+    /// slots remain distinct from `&self` or `&mut self`.
+    pub fn add_receiver_shape(&mut self, shape: &LifetimeShape) {
+        self.used_lifetimes.extend(
+            shape
+                .parameters
+                .iter()
+                .map(|lifetime| lifetime.ident.to_string()),
+        );
+        self.bindings.extend(shape.slots.iter().map(|slot| Binding {
+            path: DependencyPath {
+                segments: slot.path.clone(),
+                span: slot.lifetime.span(),
+            },
+            lifetime: slot.lifetime.clone(),
+        }));
+        self.opaque_regions
+            .extend(shape.opaque.iter().map(|slot| OpaqueRegion {
+                path: DependencyPath {
+                    segments: slot.path.clone(),
+                    span: slot.ty.span(),
+                },
+                ty: slot.ty.clone(),
+            }));
+    }
+
+    pub fn has_lifetime(&self, lifetime: &Lifetime) -> bool {
+        self.used_lifetimes.contains(&lifetime.ident.to_string())
+    }
+
     pub fn ty(&mut self, ty: &mut Type, path: &DependencyPath) -> Result<()> {
         match ty {
             Type::Reference(reference) => {
@@ -103,7 +134,9 @@ impl<'a> Elaborator<'a> {
                 };
                 self.ty(&mut reference.elem, &inner_path)?;
             }
-            Type::Path(named) if named.qself.is_none() => self.named(&mut named.path, path)?,
+            Type::Path(named) if named.qself.is_none() => {
+                self.named(&mut named.path, path, false)?
+            }
             Type::Tuple(tuple) => {
                 for (index, element) in tuple.elems.iter_mut().enumerate() {
                     self.ty(element, &path.child(index.to_string()))?;
@@ -130,7 +163,23 @@ impl<'a> Elaborator<'a> {
         Ok(())
     }
 
-    fn named(&mut self, path: &mut Path, location: &DependencyPath) -> Result<()> {
+    /// Elaborate an inherent-impl self type. A known local shape may retain
+    /// explicit lifetime arguments such as `View<'a>` so method contracts can
+    /// still address `self` fields without changing ordinary opaque-type
+    /// handling elsewhere.
+    pub fn receiver_ty(&mut self, ty: &mut Type, path: &DependencyPath) -> Result<()> {
+        match ty {
+            Type::Path(named) if named.qself.is_none() => self.named(&mut named.path, path, true),
+            _ => self.ty(ty, path),
+        }
+    }
+
+    fn named(
+        &mut self,
+        path: &mut Path,
+        location: &DependencyPath,
+        allow_explicit_shape: bool,
+    ) -> Result<()> {
         let bare = bare_path(path);
         let key = path_key(&bare);
         if path.segments.len() == 1 && path.leading_colon.is_none() {
@@ -163,7 +212,7 @@ impl<'a> Elaborator<'a> {
         // Opaque is a boundary around this named type. `named` still visits
         // its type arguments below, so `Vec<&str>` can expose the reference
         // while `Vec` itself does not need lifetime-shape metadata.
-        let opaque = generic || explicit || self.is_opaque(&bare);
+        let opaque = generic || (!allow_explicit_shape && explicit) || self.is_opaque(&bare);
         let shape = if opaque {
             None
         } else {
@@ -187,17 +236,50 @@ impl<'a> Elaborator<'a> {
                     ty: region.ty.clone(),
                 });
             }
+            let explicit_lifetimes = path
+                .segments
+                .iter()
+                .flat_map(|segment| match &segment.arguments {
+                    PathArguments::AngleBracketed(args) => args
+                        .args
+                        .iter()
+                        .filter_map(|argument| match argument {
+                            GenericArgument::Lifetime(lifetime) => Some(lifetime.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>();
             let mut arguments = BTreeMap::new();
             for parameter in &shape.parameters {
-                let first_path = shape
-                    .slots
-                    .iter()
-                    .find(|slot| slot.lifetime == *parameter)
-                    .map(|slot| location.append(&slot.path))
-                    .unwrap_or_else(|| location.child(format!("lifetime{}", arguments.len())));
-                let lifetime = self.fresh(&first_path);
+                let (lifetime, was_explicit) = if allow_explicit_shape {
+                    if let Some(lifetime) = explicit_lifetimes.get(arguments.len()).cloned() {
+                        (lifetime, true)
+                    } else {
+                        let first_path = shape
+                            .slots
+                            .iter()
+                            .find(|slot| slot.lifetime == *parameter)
+                            .map(|slot| location.append(&slot.path))
+                            .unwrap_or_else(|| {
+                                location.child(format!("lifetime{}", arguments.len()))
+                            });
+                        (self.fresh(&first_path), false)
+                    }
+                } else {
+                    let first_path = shape
+                        .slots
+                        .iter()
+                        .find(|slot| slot.lifetime == *parameter)
+                        .map(|slot| location.append(&slot.path))
+                        .unwrap_or_else(|| location.child(format!("lifetime{}", arguments.len())));
+                    (self.fresh(&first_path), false)
+                };
                 arguments.insert(parameter.ident.to_string(), lifetime.clone());
-                inserted.push(GenericArgument::Lifetime(lifetime));
+                if !was_explicit {
+                    inserted.push(GenericArgument::Lifetime(lifetime));
+                }
             }
             for slot in &shape.slots {
                 let lifetime = if slot.lifetime.ident == "static" {

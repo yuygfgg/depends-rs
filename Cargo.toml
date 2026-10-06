@@ -1,6 +1,6 @@
 [package]
 name = "depends-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Dependency-oriented lifetime elaboration for Rust"
@@ -15,7 +15,7 @@ categories = ["development-tools::procedural-macro-helpers", "rust-patterns"]
 proc-macro = true
 
 [dependencies]
-depends-rs-core = { path = "depends-rs-core", version = "0.1.0" }
+depends-rs-core = { path = "depends-rs-core", version = "0.2.0" }
 
 [workspace]
 resolver = "2"
