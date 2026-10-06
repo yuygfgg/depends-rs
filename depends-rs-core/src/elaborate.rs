@@ -33,6 +33,7 @@ pub(crate) struct Elaborator<'a> {
     options: &'a Options,
     type_parameters: BTreeMap<String, usize>,
     used_lifetimes: BTreeSet<String>,
+    self_shape: Option<LifetimeShape>,
 }
 
 impl<'a> Elaborator<'a> {
@@ -58,6 +59,7 @@ impl<'a> Elaborator<'a> {
                 .lifetimes()
                 .map(|p| p.lifetime.ident.to_string())
                 .collect(),
+            self_shape: None,
         }
     }
 
@@ -84,8 +86,10 @@ impl<'a> Elaborator<'a> {
 
     /// Add the stored lifetime slots of an enclosing inherent impl. The
     /// receiver borrow itself is added from the method signature, so these
-    /// slots remain distinct from `&self` or `&mut self`.
+    /// slots remain distinct from `&self` or `&mut self`. Keep the shape so
+    /// bare `Self` occurrences can reuse the same slots at their own paths.
     pub fn add_receiver_shape(&mut self, shape: &LifetimeShape) {
+        self.self_shape = Some(shape.clone());
         self.used_lifetimes.extend(
             shape
                 .parameters
@@ -182,6 +186,38 @@ impl<'a> Elaborator<'a> {
     ) -> Result<()> {
         let bare = bare_path(path);
         let key = path_key(&bare);
+        if path.segments.len() == 1
+            && path.leading_colon.is_none()
+            && path.segments[0].ident == "Self"
+        {
+            if let Some(shape) = self.self_shape.clone() {
+                for slot in &shape.slots {
+                    let relative = slot
+                        .path
+                        .first()
+                        .filter(|segment| segment.as_str() == "self")
+                        .map(|_| &slot.path[1..])
+                        .unwrap_or(&slot.path);
+                    self.bindings.push(Binding {
+                        path: location.append(relative),
+                        lifetime: slot.lifetime.clone(),
+                    });
+                }
+                for region in &shape.opaque {
+                    let relative = region
+                        .path
+                        .first()
+                        .filter(|segment| segment.as_str() == "self")
+                        .map(|_| &region.path[1..])
+                        .unwrap_or(&region.path);
+                    self.opaque_regions.push(OpaqueRegion {
+                        path: location.append(relative),
+                        ty: region.ty.clone(),
+                    });
+                }
+                return Ok(());
+            }
+        }
         if path.segments.len() == 1 && path.leading_colon.is_none() {
             if let Some(&parameter) = self
                 .type_parameters

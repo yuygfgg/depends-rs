@@ -22,6 +22,12 @@ struct ExplicitView<'a> {
 }
 
 #[lifetimes]
+struct Pair {
+    left: &str,
+    right: &str,
+}
+
+#[lifetimes]
 impl View {
     #[depends(return = self.data)]
     fn data(&self) -> &str {
@@ -41,6 +47,22 @@ impl View {
     #[depends(return = self.data)]
     fn into_data(self) -> &str {
         self.data
+    }
+
+    #[depends(return.left = self.data, return.right = other.data)]
+    fn pair_with(&self, other: &Self) -> Pair {
+        Pair {
+            left: self.data,
+            right: other.data,
+        }
+    }
+
+    #[depends(return.data <= text)]
+    fn replace(self, text: &str) -> Self {
+        Self {
+            data: text,
+            inner: self.inner,
+        }
     }
 }
 
@@ -71,6 +93,7 @@ fn receiver_fields_keep_stored_lifetimes_separate_from_receiver_borrows() {
     assert_eq!(view.data(), "data");
     assert_eq!(view.data_mut(), "data");
     assert_eq!(view.nested(), "inner");
+
     assert_eq!(view.into_data(), "data");
 
     let holder = Holder {
@@ -80,4 +103,23 @@ fn receiver_fields_keep_stored_lifetimes_separate_from_receiver_borrows() {
 
     let explicit = ExplicitView { data: &data };
     assert_eq!(explicit.data(), "data");
+}
+
+#[test]
+fn self_shape_applies_to_all_self_occurrences() {
+    let first = String::from("first");
+    let second = String::from("second");
+    let first_view = View {
+        data: &first,
+        inner: Inner { value: "inner" },
+    };
+    let second_view = View {
+        data: &second,
+        inner: Inner { value: "inner" },
+    };
+    let pair = first_view.pair_with(&second_view);
+    assert_eq!((pair.left, pair.right), ("first", "second"));
+
+    let replaced = second_view.replace("replacement");
+    assert_eq!(replaced.data, "replacement");
 }

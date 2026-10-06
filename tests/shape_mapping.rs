@@ -25,6 +25,12 @@ struct Cached {
     cache: &str,
 }
 
+#[lifetimes]
+struct Two {
+    left: &str,
+    right: &str,
+}
+
 #[depends(return ~= old, return.cache = cache)]
 fn replace_cache(old: State, cache: &str) -> State {
     State {
@@ -53,6 +59,17 @@ fn add_cache(old: NameOnly, cache: &str) -> Cached {
         name: old.name,
         cache,
     }
+}
+
+#[depends(out ~<= cfg)]
+fn update(out: &mut Two, cfg: &Two) {
+    out.left = cfg.left;
+    out.right = cfg.right;
+}
+
+#[depends(return ~<= old)]
+fn preserve(old: Two) -> Two {
+    old
 }
 
 #[test]
@@ -111,4 +128,31 @@ fn mapping_preserves_lifetimes_through_generic_fields() {
         (result.value.name, result.value.config.value, result.label),
         ("name", "config", "label")
     );
+}
+
+#[test]
+fn map_outlives_copies_matching_shape_constraints() {
+    let left = String::from("left");
+    let right = String::from("right");
+    let mut out = Two {
+        left: "old left",
+        right: "old right",
+    };
+    let cfg = Two {
+        left: &left,
+        right: &right,
+    };
+    update(&mut out, &cfg);
+    assert_eq!((out.left, out.right), ("left", "right"));
+}
+
+#[test]
+fn map_outlives_can_cover_a_return_aggregate() {
+    let left = String::from("left");
+    let right = String::from("right");
+    let result = preserve(Two {
+        left: &left,
+        right: &right,
+    });
+    assert_eq!((result.left, result.right), ("left", "right"));
 }

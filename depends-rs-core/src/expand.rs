@@ -30,7 +30,7 @@ pub fn expand_lifetimes(attr: TokenStream, item: TokenStream) -> Result<TokenStr
     let options: Options = syn::parse2(attr)?;
     if let Some(relation) = options.relations.first() {
         return Err(Error::new(
-            relation.target().span,
+            relation.target_span(),
             "dependency relations belong on #[depends] functions",
         ));
     }
@@ -283,9 +283,11 @@ fn apply_relations(
                 relation_source_lifetime(elaborator, source)?;
             }
             Relation::Map { source, target } => {
-                validate_shape_mapping(elaborator, target, source, &construct)?;
+                validate_shape_mapping(elaborator, target, source, &construct, "~=", "=")?;
             }
-            Relation::Outlives { .. } => unreachable!(),
+            Relation::Outlives { .. }
+            | Relation::LifetimeOutlives { .. }
+            | Relation::MapOutlives { .. } => unreachable!(),
         }
     }
     let mut substitutions = BTreeMap::new();
@@ -307,7 +309,9 @@ fn apply_relations(
             Relation::Map { source, target } => {
                 mapped_lifetime(elaborator, binding, target, source)?
             }
-            Relation::Outlives { .. } => unreachable!(),
+            Relation::Outlives { .. }
+            | Relation::LifetimeOutlives { .. }
+            | Relation::MapOutlives { .. } => unreachable!(),
         };
         if binding.lifetime.ident == "static" && source_lifetime.ident != "static" {
             return Err(Error::new(
@@ -328,23 +332,77 @@ fn apply_relations(
     if let ReturnType::Type(_, ty) = &mut signature.output {
         Substitute(&substitutions).visit_type_mut(ty);
     }
-    for relation in relations
-        .iter()
-        .filter(|r| matches!(r, Relation::Outlives { .. }))
-    {
-        let source = match relation {
-            Relation::Outlives { source, .. } => relation_source_lifetime(elaborator, source)?,
+    for relation in relations.iter().filter(|r| {
+        matches!(
+            r,
+            Relation::Outlives { .. }
+                | Relation::LifetimeOutlives { .. }
+                | Relation::MapOutlives { .. }
+        )
+    }) {
+        match relation {
+            Relation::Outlives { target, source } => {
+                let source = relation_source_lifetime(elaborator, source)?;
+                let target = unique_binding(elaborator, target)?;
+                let target_lt = substitutions
+                    .get(&target.lifetime.ident.to_string())
+                    .cloned()
+                    .unwrap_or_else(|| target.lifetime.clone());
+                signature
+                    .generics
+                    .make_where_clause()
+                    .predicates
+                    .push(syn::parse_quote!(#source: #target_lt));
+            }
+            Relation::LifetimeOutlives { target, source } => {
+                let source = relation_source_lifetime(elaborator, source)?;
+                if target.ident == "_" {
+                    return Err(Error::new(
+                        target.span(),
+                        "unsupported lifetime target `'_`; use a declared lifetime",
+                    ));
+                }
+                if !elaborator.has_lifetime(target) && target.ident != "static" {
+                    return Err(Error::new(
+                        target.span(),
+                        format!(
+                            "undeclared lifetime target `{target}`; declare it on the function"
+                        ),
+                    ));
+                }
+                let target_lt = target.clone();
+                signature
+                    .generics
+                    .make_where_clause()
+                    .predicates
+                    .push(syn::parse_quote!(#source: #target_lt));
+            }
+            Relation::MapOutlives { target, source } => {
+                validate_shape_mapping(elaborator, target, source, &construct, "~<=", "<=")?;
+                let DependencySource::Path(source) = source else {
+                    unreachable!("the parser rejects lifetime sources for ~<=");
+                };
+                for binding in elaborator.bindings.iter().filter(|binding| {
+                    binding.path.starts_with(target)
+                        && binding.path.segments.len() > target.segments.len()
+                }) {
+                    let relative = &binding.path.segments[target.segments.len()..];
+                    let source_path = source.append(relative);
+                    let source_binding = unique_binding(elaborator, &source_path)?;
+                    let target_lt = substitutions
+                        .get(&binding.lifetime.ident.to_string())
+                        .cloned()
+                        .unwrap_or_else(|| binding.lifetime.clone());
+                    let source_lt = source_binding.lifetime.clone();
+                    signature
+                        .generics
+                        .make_where_clause()
+                        .predicates
+                        .push(syn::parse_quote!(#source_lt: #target_lt));
+                }
+            }
             _ => unreachable!(),
-        };
-        let target = unique_binding(elaborator, relation.target())?;
-        let target_lt = substitutions
-            .get(&target.lifetime.ident.to_string())
-            .unwrap_or(&target.lifetime);
-        signature
-            .generics
-            .make_where_clause()
-            .predicates
-            .push(syn::parse_quote!(#source: #target_lt));
+        }
     }
     // Only output occurrences are replaced. Keep explicit parameters and any
     // generated parameter that is also used by an input.
@@ -435,6 +493,8 @@ fn validate_shape_mapping(
     target: &DependencyPath,
     source: &DependencySource,
     relations: &[&Relation],
+    operator: &str,
+    scalar_operator: &str,
 ) -> Result<()> {
     let DependencySource::Path(source) = source else {
         unreachable!("the parser rejects lifetime sources for ~=");
@@ -456,8 +516,8 @@ fn validate_shape_mapping(
         return Err(Error::new(
             target.span,
             format!(
-                "`{}` is not an aggregate target; use `=` for a scalar relation",
-                target.display()
+                "`{}` is not an aggregate target; use `{scalar_operator}` for a scalar relation",
+                target.display(),
             ),
         ));
     }
@@ -467,7 +527,10 @@ fn validate_shape_mapping(
     if !source_is_aggregate {
         return Err(Error::new(
             source.span,
-            format!("`{}` is not an aggregate source for `~=`", source.display()),
+            format!(
+                "`{}` is not an aggregate source for `{operator}`",
+                source.display()
+            ),
         ));
     }
     for binding in elaborator.bindings.iter().filter(|binding| {
@@ -489,7 +552,7 @@ fn validate_shape_mapping(
             return Err(Error::new(
                 binding.path.span,
                 format!(
-                    "shape mapping `{}` ~= `{}` is missing source path `{}` for target `{}`",
+                    "shape mapping `{}` {operator} `{}` is missing source path `{}` for target `{}`",
                     target.display(),
                     source.display(),
                     source_path.display(),

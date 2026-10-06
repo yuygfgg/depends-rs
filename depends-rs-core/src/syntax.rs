@@ -115,6 +115,14 @@ pub enum Relation {
         target: DependencyPath,
         source: DependencySource,
     },
+    LifetimeOutlives {
+        target: Lifetime,
+        source: DependencySource,
+    },
+    MapOutlives {
+        target: DependencyPath,
+        source: DependencySource,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -140,17 +148,32 @@ impl DependencySource {
 }
 
 impl Relation {
+    pub(crate) fn target_span(&self) -> Span {
+        match self {
+            Self::Construct { target, .. }
+            | Self::Map { target, .. }
+            | Self::Outlives { target, .. }
+            | Self::MapOutlives { target, .. } => target.span,
+            Self::LifetimeOutlives { target, .. } => target.span(),
+        }
+    }
+
     pub(crate) fn target(&self) -> &DependencyPath {
         match self {
             Self::Construct { target, .. }
             | Self::Map { target, .. }
-            | Self::Outlives { target, .. } => target,
+            | Self::Outlives { target, .. }
+            | Self::MapOutlives { target, .. } => target,
+            _ => panic!("lifetime relation target has no dependency path"),
         }
     }
     pub(crate) fn source(&self) -> &DependencySource {
         match self {
-            Self::Construct { source, .. } | Self::Outlives { source, .. } => source,
-            Self::Map { source, .. } => source,
+            Self::Construct { source, .. }
+            | Self::Map { source, .. }
+            | Self::Outlives { source, .. }
+            | Self::LifetimeOutlives { source, .. }
+            | Self::MapOutlives { source, .. } => source,
         }
     }
 }
@@ -179,45 +202,96 @@ impl Parse for Options {
         let mut options = Self::default();
         while !input.is_empty() {
             let look = input.fork();
-            let first = Ident::parse_any(&look)?;
-            if first == "opaque" && look.peek(syn::token::Paren) {
+            let first = if input.peek(Lifetime) {
+                None
+            } else {
+                Some(Ident::parse_any(&look)?)
+            };
+            if first.as_ref().is_some_and(|first| first == "opaque") && look.peek(syn::token::Paren)
+            {
                 input.parse::<Ident>()?;
                 let contents;
                 syn::parenthesized!(contents in input);
                 options
                     .opaque
                     .extend(Punctuated::<Path, Token![,]>::parse_terminated(&contents)?);
-            } else if first == "crate_path" && look.peek(Token![=]) {
+            } else if first.as_ref().is_some_and(|first| first == "crate_path")
+                && look.peek(Token![=])
+            {
                 input.parse::<Ident>()?;
                 input.parse::<Token![=]>()?;
                 options.crate_path = input.parse()?;
-            } else if first == "receiver" && look.peek(Token![=]) {
+            } else if first.as_ref().is_some_and(|first| first == "receiver")
+                && look.peek(Token![=])
+            {
                 input.parse::<Ident>()?;
                 input.parse::<Token![=]>()?;
                 let group;
                 syn::braced!(group in input);
                 options.receiver = Some(group.parse()?);
             } else {
-                let target = input.parse()?;
+                let target = parse_target(input)?;
                 let relation = if input.peek(Token![<=]) {
                     input.parse::<Token![<=]>()?;
-                    Relation::Outlives {
-                        target,
-                        source: parse_source(input)?,
+                    let source = parse_source(input)?;
+                    match target {
+                        RelationTarget::Path(target) => Relation::Outlives { target, source },
+                        RelationTarget::Lifetime(target) => {
+                            Relation::LifetimeOutlives { target, source }
+                        }
                     }
                 } else if input.peek(Token![~]) {
                     input.parse::<Token![~]>()?;
-                    input.parse::<Token![=]>()?;
-                    let source = parse_source(input)?;
-                    if matches!(source, DependencySource::Lifetime(_)) {
-                        return Err(syn::Error::new(
-                            source.span(),
-                            "the ~= relation requires an aggregate dependency path",
-                        ));
+                    if input.peek(Token![<=]) {
+                        input.parse::<Token![<=]>()?;
+                        let source = parse_source(input)?;
+                        let target = match target {
+                            RelationTarget::Path(target) => target,
+                            RelationTarget::Lifetime(target) => {
+                                return Err(syn::Error::new(
+                                    target.span(),
+                                    "the ~<= relation requires an aggregate dependency path",
+                                ));
+                            }
+                        };
+                        if matches!(source, DependencySource::Lifetime(_)) {
+                            return Err(syn::Error::new(
+                                source.span(),
+                                "the ~<= relation requires an aggregate dependency path",
+                            ));
+                        }
+                        Relation::MapOutlives { target, source }
+                    } else {
+                        input.parse::<Token![=]>()?;
+                        let source = parse_source(input)?;
+                        let target = match target {
+                            RelationTarget::Path(target) => target,
+                            RelationTarget::Lifetime(target) => {
+                                return Err(syn::Error::new(
+                                    target.span(),
+                                    "the ~= relation requires an aggregate dependency path",
+                                ));
+                            }
+                        };
+                        if matches!(source, DependencySource::Lifetime(_)) {
+                            return Err(syn::Error::new(
+                                source.span(),
+                                "the ~= relation requires an aggregate dependency path",
+                            ));
+                        }
+                        Relation::Map { target, source }
                     }
-                    Relation::Map { target, source }
                 } else {
                     input.parse::<Token![=]>()?;
+                    let target = match target {
+                        RelationTarget::Path(target) => target,
+                        RelationTarget::Lifetime(target) => {
+                            return Err(syn::Error::new(
+                                target.span(),
+                                "the = relation requires a dependency path target",
+                            ));
+                        }
+                    };
                     Relation::Construct {
                         target,
                         source: parse_source(input)?,
@@ -238,6 +312,19 @@ fn parse_source(input: ParseStream) -> Result<DependencySource> {
         Ok(DependencySource::Lifetime(input.parse()?))
     } else {
         Ok(DependencySource::Path(input.parse()?))
+    }
+}
+
+enum RelationTarget {
+    Path(DependencyPath),
+    Lifetime(Lifetime),
+}
+
+fn parse_target(input: ParseStream) -> Result<RelationTarget> {
+    if input.peek(Lifetime) {
+        Ok(RelationTarget::Lifetime(input.parse()?))
+    } else {
+        Ok(RelationTarget::Path(input.parse()?))
     }
 }
 
@@ -386,12 +473,14 @@ impl ToTokens for Options {
             parts.push(quote! { opaque(#path) });
         }
         for relation in &self.relations {
-            let (target, source, op) = match relation {
-                Relation::Construct { target, source } => (target, source, quote!(=)),
-                Relation::Map { target, source } => (target, source, quote!(~=)),
-                Relation::Outlives { target, source } => (target, source, quote!(<=)),
+            let relation = match relation {
+                Relation::Construct { target, source } => quote!(#target = #source),
+                Relation::Map { target, source } => quote!(#target ~= #source),
+                Relation::Outlives { target, source } => quote!(#target <= #source),
+                Relation::LifetimeOutlives { target, source } => quote!(#target <= #source),
+                Relation::MapOutlives { target, source } => quote!(#target ~<= #source),
             };
-            parts.push(quote! { #target #op #source });
+            parts.push(relation);
         }
         out.extend(quote! { #(#parts),* });
     }
