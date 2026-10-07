@@ -1,4 +1,4 @@
-name: Publish crates
+name: Publish crates and GitHub Release
 
 on:
   push:
@@ -23,3 +23,16 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --workspace --locked
+
+  release:
+    name: Publish GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
